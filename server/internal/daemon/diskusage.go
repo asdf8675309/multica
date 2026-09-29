@@ -623,9 +623,9 @@ func taskRootRecordCount(workspacesRoot string) (int, error) {
 }
 
 // inspectGitWorktree finds every Git worktree under workDir and returns each
-// changed path reported by porcelain status. A task without a Git worktree is
-// deliberately not treated as clean: there is no tree whose contents we can
-// prove safe to remove.
+// changed path reported by porcelain status. Git-ignored files are omitted:
+// they are regenerable and do not block reaping. A task without a Git worktree
+// is deliberately not treated as clean because its contents cannot be checked.
 func inspectGitWorktree(ctx context.Context, workDir string) ([]string, error) {
 	repositories, err := gitWorktreeRoots(workDir)
 	if err != nil {

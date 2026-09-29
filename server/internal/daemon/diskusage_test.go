@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -830,6 +831,74 @@ func TestReapTerminalCleanWorkspaces_TreeCheckControlsApply(t *testing.T) {
 			t.Fatalf("after task roots=%d, want 1 after refusal", got)
 		}
 	})
+}
+
+func TestReapTerminalCleanWorkspaces_IgnoredFilesDoNotBlockTrackedEditsDo(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		ignoredFile   bool
+		trackedEdit   bool
+		wantAction    string
+		wantTaskCount int
+	}{
+		{name: "ignored files are reaped", ignoredFile: true, wantAction: "removed", wantTaskCount: 0},
+		{name: "uncommitted tracked edit is kept", trackedEdit: true, wantAction: "skipped", wantTaskCount: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			workspaceID := "11111111-1111-1111-1111-111111111111"
+			taskID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+			taskRoot := filepath.Join(root, workspaceID, taskID)
+			workDir := filepath.Join(taskRoot, "workdir")
+			writeReapTaskOwner(t, taskRoot, workspaceID, taskID)
+			if err := os.MkdirAll(workDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(workDir, ".gitignore"), []byte("generated/\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(workDir, "tracked.txt"), []byte("committed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for _, args := range [][]string{{"init", "--quiet", workDir}, {"-C", workDir, "config", "user.name", "Reaper test"}, {"-C", workDir, "config", "user.email", "reaper-test@example.invalid"}, {"-C", workDir, "add", ".gitignore", "tracked.txt"}, {"-C", workDir, "commit", "--quiet", "-m", "fixture"}} {
+				cmd := exec.Command("git", args...)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v: %s", args, err, output)
+				}
+			}
+			if tc.ignoredFile {
+				writeFile(t, filepath.Join(workDir, "generated", "cache.bin"), 10)
+			}
+			if tc.trackedEdit {
+				if err := os.WriteFile(filepath.Join(workDir, "tracked.txt"), []byte("modified\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			diskReport := DiskUsageReport{
+				WorkspacesRoot: root,
+				Tasks: []TaskDiskUsage{{
+					Path: taskRoot, Kind: string(execenv.GCKindIssue), ParentID: "issue-done", ParentStatus: "done",
+				}},
+				TotalTaskCount: 1,
+			}
+			report, err := reapTerminalCleanWorkspaces(context.Background(), root, diskReport, nil, true, workspaceReapOptions{
+				inspectTree: inspectGitWorktree,
+				removeRoot: func(_ context.Context, _ string, path string, _ func(context.Context, string) ([]string, error)) error {
+					return os.RemoveAll(path)
+				},
+			})
+			if err != nil {
+				t.Fatalf("reapTerminalCleanWorkspaces: %v", err)
+			}
+			if got := report.Results[0].Action; got != tc.wantAction {
+				t.Fatalf("action=%q, want %q (reason: %s; files: %v)", got, tc.wantAction, report.Results[0].Reason, report.Results[0].Files)
+			}
+			if got := report.After.TaskRootCount; got != tc.wantTaskCount {
+				t.Fatalf("after task roots=%d, want %d", got, tc.wantTaskCount)
+			}
+		})
+	}
 }
 
 func TestRemoveOwnedCleanTaskRootRefusesIdentitySwap(t *testing.T) {
