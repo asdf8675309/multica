@@ -273,7 +273,9 @@ Daemon behavior is configured via flags or environment variables:
 | Codex handshake timeout | `--codex-handshake-timeout` | `MULTICA_CODEX_HANDSHAKE_TIMEOUT` | `30s`; `thread/start` and `thread/resume`: `60s` (an explicit value overrides both budgets globally) |
 | Codex turn-interrupt timeout | — | `MULTICA_CODEX_TURN_INTERRUPT_TIMEOUT` | `2s` (bounded grace period for `turn/interrupt` acknowledgement and `turn/completed`; tune from the logged interrupt latency on unusually slow hosts) |
 | OpenCode idle watchdog | — | `MULTICA_OPENCODE_IDLE_WATCHDOG` | `10m` (`0` falls back to the generic idle watchdog; cannot extend it) |
-| Max concurrent tasks | `--max-concurrent-tasks` | `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` | `20` |
+| Max concurrent tasks | `--max-concurrent-tasks` | `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` | derived from host CPU and memory, at most `20` (see below) |
+| Per-task memory estimate | — | `MULTICA_DAEMON_TASK_MEMORY_MB` | `2048` (feeds the derived max concurrent tasks) |
+| Memory reserved for the host | — | `MULTICA_DAEMON_TASK_MEMORY_RESERVE_MB` | `2048` (feeds the derived max concurrent tasks; `0` is valid) |
 | Daemon ID | `--daemon-id` | `MULTICA_DAEMON_ID` | hostname |
 | Device name | `--device-name` | `MULTICA_DAEMON_DEVICE_NAME` | hostname |
 | Runtime name | `--runtime-name` | `MULTICA_AGENT_RUNTIME_NAME` | `Local Agent` |
@@ -284,12 +286,37 @@ Daemon behavior is configured via flags or environment variables:
 | GC completed-task TTL (issue tasks) | — | `MULTICA_GC_COMPLETED_TASK_TTL` | `14d` on Multica Cloud, `0` (disabled) elsewhere |
 | GC orphan TTL (no `.gc_meta.json`) | — | `MULTICA_GC_ORPHAN_TTL` | `72h` |
 | GC artifact TTL (completed tasks) | — | `MULTICA_GC_ARTIFACT_TTL` | `12h` (set `0` to disable) |
+| GC terminal artifact TTL (done/cancelled cards) | — | `MULTICA_GC_TERMINAL_ARTIFACT_TTL` | `0` (same as `MULTICA_GC_ARTIFACT_TTL`) |
+| GC salvage (save unsaved work before removal) | — | `MULTICA_GC_SALVAGE` | `true` (set `false`/`0` to delete without looking, as before) |
+| GC salvage bundle cap | — | `MULTICA_GC_SALVAGE_MAX_MB` | `500` |
+| GC salvage directory cap | — | `MULTICA_GC_SALVAGE_TOTAL_MAX_MB` | `2048` |
+| GC salvage TTL | — | `MULTICA_GC_SALVAGE_TTL` | `168h` (set `0` to keep bundles until you delete them) |
 | GC artifact patterns | — | `MULTICA_GC_ARTIFACT_PATTERNS` | `node_modules,.next,.turbo` |
 | GC repo cache TTL (`.repos`) | — | `MULTICA_GC_REPO_TTL` | `720h` (30d; set `0` to disable) |
 | GC repo maintenance | — | `MULTICA_GC_REPO_MAINTENANCE_ENABLED` | `true` (set `false`/`0` to disable heavy Git maintenance only) |
 | GC Hermes memory TTL (per-agent `memories/`) | — | `MULTICA_GC_HERMES_MEMORY_TTL` | `2160h` (90d; set `0` to disable) |
 | GC Hermes session TTL (per-conversation `state.db`) | — | `MULTICA_GC_HERMES_SESSION_TTL` | `336h` (14d; set `0` to disable) |
 | GC task temp legacy TTL (pre-lock `multica-task-*`) | — | `MULTICA_GC_TASK_TEMP_LEGACY_TTL` | `0` (disabled; set a duration to opt in) |
+
+When max concurrent tasks is not set by a flag, env var or `config.json`, the daemon derives it: `min(20, CPUs, (total memory - task_memory_reserve_mb) / task_memory_mb)`, never below 1. For example, an 8 CPU VM sold as 16 GB usually reports about 15,400 MB, so it gets `min(20, 8, (15400 - 2048) / 2048)` = 6. A flat 20 is too many for a host that size: one task can be an agent CLI plus an `npm ci` that uses about 1.2 GB, and 20 of them at once can fill memory and swap. Total memory comes from `/proc/meminfo` on Linux and `sysctl hw.memsize` on macOS. If it cannot be read (Windows, or an unreadable file) the limit falls back to `20`, and `daemon start` logs why. `daemon start` logs the derived limit and its inputs once. An explicit value always wins.
+
+`task_memory_mb` (positive integer) and `task_memory_reserve_mb` (integer >= 0) can be stored with `multica config set`, like the GC keys. They have no flag, so the order is: env var, then `config.json`, then the default. `config set` rejects a bad value, a hand-edited bad value makes `daemon start` fail, and `""` clears a key.
+
+Nine GC settings can also be stored in the CLI config (`~/.multica/config.json`) with `multica config set <key> <value>`, so they survive a daemon restart without an env var. `multica config show` lists them. They have no flag, so the order is: `MULTICA_GC_…` env var, then `config.json`, then the default above.
+
+| `config.json` key | Env variable | Accepted values |
+|-------------------|--------------|-----------------|
+| `gc_interval` | `MULTICA_GC_INTERVAL` | positive Go duration |
+| `gc_ttl` | `MULTICA_GC_TTL` | positive Go duration |
+| `gc_artifact_ttl` | `MULTICA_GC_ARTIFACT_TTL` | Go duration, `0s` disables |
+| `gc_codex_session_ttl` | `MULTICA_GC_CODEX_SESSION_TTL` | Go duration, `0s` as for the env var |
+| `gc_terminal_artifact_ttl` | `MULTICA_GC_TERMINAL_ARTIFACT_TTL` | Go duration, `0s` = same as `gc_artifact_ttl` |
+| `gc_salvage` | `MULTICA_GC_SALVAGE` | `true` or `false` |
+| `gc_salvage_max_mb` | `MULTICA_GC_SALVAGE_MAX_MB` | integer >= 0 |
+| `gc_salvage_total_max_mb` | `MULTICA_GC_SALVAGE_TOTAL_MAX_MB` | integer >= 0 |
+| `gc_salvage_ttl` | `MULTICA_GC_SALVAGE_TTL` | Go duration, `0s` keeps bundles |
+
+The keys take standard Go durations (`12h`, `90m`). The `d` suffix that the env vars accept (`7d`) is not accepted here, so write `168h`. `config set` rejects a value that does not parse, such as `60mm`. A hand-edited `config.json` with such a value makes `daemon start` fail with an error, and the daemon does not fall back to the default. Set a key to `""` to clear it (`multica config set gc_salvage_ttl ""`).
 
 #### Workspace garbage collection
 
@@ -299,8 +326,13 @@ The daemon periodically scans `MULTICA_WORKSPACES_ROOT` and applies several disk
 - **Completed-task retention bound** — `MULTICA_GC_COMPLETED_TASK_TTL` fully removes an inactive issue task once its `.gc_meta.json` `completed_at` age exceeds the configured duration, even while the parent issue remains open. Cleanup waits for a successful parent-issue status check, never removes an active environment, and never fully removes a `local_directory` environment. A later rerun provisions a fresh environment instead of resuming the removed checkout.
   - The default depends on where the daemon points: `14d` against Multica Cloud, and `0` (disabled, retain indefinitely) for self-host and every other origin — including cloud staging and previews. Set the variable to opt in or out on either side; an explicit `0` disables the policy on Cloud too.
   - Removing an environment discards work an agent left uncommitted or unpushed on its branch, along with that task's `output/` and `logs/`. The per-issue Codex session store lives outside `MULTICA_WORKSPACES_ROOT` under its own TTL, so a later rerun still resumes the agent's prior session — it just starts from a fresh checkout. Size the TTL against that trade, and keep it comfortably above `MULTICA_GC_INTERVAL`: the active-root guard protects a task that is currently running, not one whose follow-up run is queued but unclaimed.
+- **Salvage before removal** — the two cleanups above and the orphan cleanup below delete Git checkouts, and the repo-cache cleanup deletes `agent/*` branches. Before any of them deletes work it checks whether that work exists anywhere else. A checkout is *safe* when `git status` shows no changed or untracked file (Git-ignored files do not count) and its `HEAD` is contained in a remote-tracking ref of `origin`. A safe checkout is removed as before. An unsafe one is written to a Git bundle plus a JSON manifest in `<MULTICA_WORKSPACES_ROOT>/.salvage/`, and only then removed. The bundle holds one snapshot commit (parent `HEAD`, with the tracked edits and the untracked files) plus every commit `origin` lacks. Taking the snapshot does not change the checkout or the shared repo cache. An `agent/*` branch with commits `origin` lacks is bundled the same way before `git branch -D`.
+  - **The GC fails closed.** If salvage errors, if the unsaved files or the bundle exceed `MULTICA_GC_SALVAGE_MAX_MB`, or if `.salvage` already holds `MULTICA_GC_SALVAGE_TOTAL_MAX_MB`, the directory or branch is kept and a warning names the reason. The warning appears on the first failure and then once per 24 hours per directory. A kept directory is retried on every cycle, so raise a cap or free space to let it go. Nothing in `.salvage` is evicted early.
+  - **Every bundle has a manifest** (`<name>.json` beside `<name>.bundle`) with the task directory, workspace, task and issue ids, branch, `HEAD`, the changed-file list, the ref name inside the bundle, and the prerequisite commit ids. To restore, run `git fetch <name>.bundle <bundle_ref>` inside a clone that has those commits (they exist on GitHub for pushed history). The manifest also lists the names and sizes of ignored files, which the bundle does not hold, and states that Git LFS objects are not in it.
+  - `.salvage` entries older than `MULTICA_GC_SALVAGE_TTL` are removed each cycle. `multica daemon disk-usage --output json` reports the `.salvage` footprint (`salvage_size_bytes`, `salvage_count`). A squash-merged branch whose remote branch was deleted looks unpushed, so it is salvaged; that is safe and wasteful, not lossy. Set `MULTICA_GC_SALVAGE=false` to restore the old delete-without-looking behavior.
 - **Orphan cleanup** — task directories with no `.gc_meta.json` (e.g. left over from a daemon crash) are removed once they exceed `MULTICA_GC_ORPHAN_TTL`.
 - **Artifact-only cleanup** — when a task has been completed for at least `MULTICA_GC_ARTIFACT_TTL` but the issue is still open, regenerable build outputs whose directory basename matches `MULTICA_GC_ARTIFACT_PATTERNS` are removed. The daemon also reclaims the exact managed path `codex-home/.sandbox-bin`; old task metadata without `completed_at` becomes eligible for this managed-only cleanup after its `.gc_meta.json` file has been idle for `MULTICA_GC_ORPHAN_TTL`. The rest of the task (source, `.git`, `output/`, `logs/`, `.gc_meta.json`, Codex auth/config/session state) is preserved so the agent can resume it.
+- **Terminal artifact TTL** — `MULTICA_GC_TERMINAL_ARTIFACT_TTL` sets the artifact TTL for a card whose status is `done` or `cancelled`, so its `node_modules` and similar directories go sooner than those of an open card. Open cards, `in_review` included, keep `MULTICA_GC_ARTIFACT_TTL`. `0` (the default) means "the same as `MULTICA_GC_ARTIFACT_TTL`". `MULTICA_GC_ARTIFACT_TTL=0` still disables artifact cleanup for every card. The clock is the task's `completed_at`. After a terminal card's artifacts are cleared the daemon writes `.gc_artifacts_cleaned` in the task directory and does not walk the directory again until the task completes again.
 - **Managed-cache reclamation** — the exact managed path above is reclaimed for *every* task kind once the task has been completed for `MULTICA_GC_ARTIFACT_TTL`, not just for issue tasks whose issue is still open. It applies even while the parent record says the directory itself must stay — an active chat session, a still-running autopilot run — and even when the parent record could not be reached this cycle, because the contents are regenerable and the next run re-provisions them on demand. A task currently running on the directory is never touched. Set `MULTICA_GC_ARTIFACT_TTL=0` to disable this along with the rest of artifact cleanup.
 
 - **Repo cache eviction** — the bare git clones under `.repos/` are shared object stores: each task workdir is a `git worktree` off one of them rather than its own clone, so a task's `.git` is only a pointer file. They are evicted only when all of the following hold: the repo is no longer attached to any workspace this daemon watches, it has no worktrees left, and no task has created a worktree from it for `MULTICA_GC_REPO_TTL`. A cache created before this stamp existed is not treated as ancient — its clock starts at the first GC cycle that sees it, so upgrading does not wipe every cache. Evicting is safe by construction: the next task that needs the repo re-clones it on demand, so a wrong eviction costs a clone, not a failure.

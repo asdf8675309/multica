@@ -80,6 +80,22 @@ func intFromEnv(key string, fallback int) (int, error) {
 	return n, nil
 }
 
+const bytesPerMegabyte = int64(1024 * 1024)
+
+// megabytesFromEnv reads a non-negative size in megabytes. A negative value is
+// an error rather than a silent zero: for the salvage caps zero means "keep
+// everything", and a typo must not select the strictest setting unnoticed.
+func megabytesFromEnv(key string, fallback int) (int64, error) {
+	n, err := intFromEnv(key, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s: must not be negative, got %d", key, n)
+	}
+	return int64(n), nil
+}
+
 func sleepWithContext(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()

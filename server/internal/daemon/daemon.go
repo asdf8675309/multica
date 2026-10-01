@@ -389,6 +389,10 @@ type Daemon struct {
 	skillCache *SkillBundleCache
 	logger     *slog.Logger
 
+	// salvageWarn rate-limits the GC's "kept an agent branch" warning, which
+	// would otherwise repeat every cycle for a branch that stays unsalvageable.
+	salvageWarn salvageWarnLimiter
+
 	// terminalReports is the durable outbox for complete/fail callbacks. The
 	// sender hook is production-wired through Client and overridable in focused
 	// tests; terminalReportWakeup coalesces new-report and reconnect nudges.

@@ -1571,7 +1571,25 @@ func inspectCheckoutContext(ctx context.Context, path string) (*WorktreeResult, 
 // countUnpushedCommitsContext counts the commits reachable from ref that no
 // remote-tracking ref reaches: work whose only copy is this repository.
 func countUnpushedCommitsContext(ctx context.Context, repoPath, ref string) (int, error) {
-	out, err := runGitOutputContext(ctx, "-C", repoPath, "rev-list", "--count", ref, "--not", "--remotes")
+	return countCommitsNotOnContext(ctx, repoPath, ref, "--remotes")
+}
+
+// CountCommitsNotOnRemote counts the commits reachable from ref that no
+// remote-tracking ref of the named remote reaches. The GC uses it to decide
+// whether removing a checkout or a branch loses work.
+//
+// It names the remote on purpose. A bare `--remotes` also counts refs of any
+// other remote configured in the repository, and a commit that only a foreign
+// remote holds is not backed up on the origin the daemon fetches from.
+func CountCommitsNotOnRemote(ctx context.Context, repoPath, ref, remote string) (int, error) {
+	if remote == "" {
+		return 0, errors.New("count commits not on remote: remote name is empty")
+	}
+	return countCommitsNotOnContext(ctx, repoPath, ref, "--remotes="+remote)
+}
+
+func countCommitsNotOnContext(ctx context.Context, repoPath, ref, notRefs string) (int, error) {
+	out, err := runGitOutputContext(ctx, "-C", repoPath, "rev-list", "--count", ref, "--not", notRefs)
 	if err != nil {
 		return 0, fmt.Errorf("count unpushed commits on %s: %w", ref, err)
 	}

@@ -69,6 +69,12 @@ type DiskUsageReport struct {
 	// against per-task numbers that do not contain it.
 	RepoCacheSizeBytes int64 `json:"repo_cache_size_bytes"`
 	RepoCacheCount     int   `json:"repo_cache_count"`
+	// SalvageSizeBytes is the .salvage footprint: bundles of work the GC saved
+	// before deleting a checkout. Like the repo cache it is a sibling of the
+	// task directories and excluded from Total*. Operators need it because the
+	// GC stops salvaging at MULTICA_GC_SALVAGE_TOTAL_MAX_MB and keeps checkouts.
+	SalvageSizeBytes int64 `json:"salvage_size_bytes"`
+	SalvageCount     int   `json:"salvage_count"`
 }
 
 // DiskUsageRoot pairs a workspaces root with the profile it was derived from
@@ -102,6 +108,8 @@ type AggregateDiskUsageReport struct {
 	TotalArtifactRatio      float64         `json:"total_artifact_ratio"`
 	TotalRepoCacheSizeBytes int64           `json:"total_repo_cache_size_bytes"`
 	TotalRepoCacheCount     int             `json:"total_repo_cache_count"`
+	TotalSalvageSizeBytes   int64           `json:"total_salvage_size_bytes"`
+	TotalSalvageCount       int             `json:"total_salvage_count"`
 }
 
 // ScanDiskUsageRoots scans every root in order and returns the combined report.
@@ -127,6 +135,8 @@ func ScanDiskUsageRoots(roots []DiskUsageRoot, artifactPatterns []string) (Aggre
 		agg.TotalArtifactSizeBytes += report.TotalArtifactSizeBytes
 		agg.TotalRepoCacheSizeBytes += report.RepoCacheSizeBytes
 		agg.TotalRepoCacheCount += report.RepoCacheCount
+		agg.TotalSalvageSizeBytes += report.SalvageSizeBytes
+		agg.TotalSalvageCount += report.SalvageCount
 	}
 	agg.TotalArtifactRatio = ratio(agg.TotalArtifactSizeBytes, agg.TotalSizeBytes)
 	return agg, nil
@@ -182,6 +192,10 @@ func ScanDiskUsage(workspacesRoot string, artifactPatterns []string) (DiskUsageR
 		// total disagree with the user's file manager for no stated reason.
 		if wsEntry.Name() == reposDirName {
 			report.RepoCacheSizeBytes, report.RepoCacheCount = repoCacheSize(filepath.Join(workspacesRoot, wsEntry.Name()))
+			continue
+		}
+		if wsEntry.Name() == salvageDirName {
+			report.SalvageSizeBytes, report.SalvageCount = salvageSize(filepath.Join(workspacesRoot, wsEntry.Name()))
 			continue
 		}
 		// Other dot-directories are daemon-internal caches (skill bundles and
@@ -243,6 +257,22 @@ func ScanDiskUsage(workspacesRoot string, artifactPatterns []string) (DiskUsageR
 	report.TotalArtifactRatio = ratio(report.TotalArtifactSizeBytes, report.TotalSizeBytes)
 
 	return report, nil
+}
+
+// salvageSize measures .salvage and counts its bundles, the unit an operator
+// restores from. Scratch directories of a running salvage count toward the
+// size and not toward the count.
+func salvageSize(root string) (sizeBytes int64, bundleCount int) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, 0
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".bundle") {
+			bundleCount++
+		}
+	}
+	return dirSize(root), bundleCount
 }
 
 // repoCacheSize measures the bare-repo cache and counts the repos in it.

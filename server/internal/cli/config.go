@@ -63,6 +63,15 @@ type CLIConfig struct {
 	// MULTICA_DAEMON_MAX_CONCURRENT_TASKS env, this field, default.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks,omitempty"`
 
+	// TaskMemoryMB and TaskMemoryReserveMB feed the derived default for
+	// max_concurrent_tasks, which applies only when that limit is not set:
+	// (host memory - reserve) / per-task memory. They mirror
+	// MULTICA_DAEMON_TASK_MEMORY_MB and MULTICA_DAEMON_TASK_MEMORY_RESERVE_MB
+	// and have no --flag, so precedence is: env, this field, built-in
+	// default. Pointers because a reserve of 0 is a valid value.
+	TaskMemoryMB        *int `json:"task_memory_mb,omitempty"`
+	TaskMemoryReserveMB *int `json:"task_memory_reserve_mb,omitempty"`
+
 	// PollInterval is how often the daemon polls the server for new tasks
 	// (Go duration string, e.g. "10s", "500ms"). Same persist-once
 	// motivation as MaxConcurrentTasks. Empty ("") means "not set — use
@@ -143,6 +152,22 @@ type CLIConfig struct {
 	// --no-auto-reload flag, MULTICA_DAEMON_AUTO_RELOAD=false env, this
 	// field, default (enabled).
 	DisableAutoReload bool `json:"disable_auto_reload,omitempty"`
+
+	// GC settings, each mirroring its MULTICA_GC_* env var. None has a
+	// --flag, so precedence is: env, this field, built-in default. Durations
+	// are Go duration strings and "" means "not set". The int and bool
+	// fields are pointers because zero and false are meaningful values
+	// (gc_salvage_max_mb 0 keeps every checkout that holds unsaved work,
+	// gc_salvage false turns salvage off), so nil is the only "not set".
+	GCArtifactTTL         string `json:"gc_artifact_ttl,omitempty"`
+	GCTTL                 string `json:"gc_ttl,omitempty"`
+	GCInterval            string `json:"gc_interval,omitempty"`
+	GCCodexSessionTTL     string `json:"gc_codex_session_ttl,omitempty"`
+	GCTerminalArtifactTTL string `json:"gc_terminal_artifact_ttl,omitempty"`
+	GCSalvage             *bool  `json:"gc_salvage,omitempty"`
+	GCSalvageMaxMB        *int   `json:"gc_salvage_max_mb,omitempty"`
+	GCSalvageTotalMaxMB   *int   `json:"gc_salvage_total_max_mb,omitempty"`
+	GCSalvageTTL          string `json:"gc_salvage_ttl,omitempty"`
 
 	// Backends contains per-backend overrides for users who want to point
 	// the daemon at non-default tool installations (e.g. an OpenClaw bundled

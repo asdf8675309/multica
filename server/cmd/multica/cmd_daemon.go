@@ -1065,8 +1065,7 @@ func runDaemonForeground(cmd *cobra.Command) error {
 	if autoUpdateOverride > 0 {
 		overrides.AutoUpdateCheckInterval = autoUpdateOverride
 	}
-
-	cfg, err := daemon.LoadConfig(overrides)
+	cfg, err := loadDaemonStartConfig(overrides, fileCfg)
 	if err != nil {
 		return err
 	}
@@ -1768,6 +1767,89 @@ func resolveDaemonDisableSignal(flagValue bool, envName string, cfgValue bool) b
 		return false
 	}
 	return cfgValue
+}
+
+// loadDaemonStartConfig is the last step of `daemon start` before the daemon
+// is built: resolve the config.json keys that have no --flag against the env,
+// load the config, and log how the task limit was derived. The precedence
+// tests call it too, so they exercise the start path rather than a copy of it.
+func loadDaemonStartConfig(overrides daemon.Overrides, fileCfg cli.CLIConfig) (daemon.Config, error) {
+	if err := applyGCConfigOverrides(&overrides, fileCfg); err != nil {
+		return daemon.Config{}, err
+	}
+	applyTaskMemoryConfigOverrides(&overrides, fileCfg)
+	cfg, err := daemon.LoadConfig(overrides)
+	if err != nil {
+		return daemon.Config{}, err
+	}
+	cfg.LogMaxConcurrentTasksDerivation()
+	return cfg, nil
+}
+
+// applyTaskMemoryConfigOverrides copies the persisted task_memory_* keys into
+// overrides when their env vars are unset. Range checks live in
+// daemon.LoadConfig, so a hand-edited value fails daemon start there.
+func applyTaskMemoryConfigOverrides(o *daemon.Overrides, fileCfg cli.CLIConfig) {
+	if envUnset("MULTICA_DAEMON_TASK_MEMORY_MB") {
+		o.TaskMemoryMB = fileCfg.TaskMemoryMB
+	}
+	if envUnset("MULTICA_DAEMON_TASK_MEMORY_RESERVE_MB") {
+		o.TaskMemoryReserveMB = fileCfg.TaskMemoryReserveMB
+	}
+}
+
+// applyGCConfigOverrides copies the persisted gc_* keys into overrides. The
+// GC settings have no --flag, so each config.json value applies only when
+// its MULTICA_GC_* env var is unset; otherwise the override stays nil and
+// daemon.LoadConfig reads the env itself.
+func applyGCConfigOverrides(o *daemon.Overrides, fileCfg cli.CLIConfig) error {
+	for _, d := range []struct {
+		env  string
+		cfg  string
+		zero bool // whether 0 is a valid value for this setting
+		dst  **time.Duration
+	}{
+		{"MULTICA_GC_ARTIFACT_TTL", fileCfg.GCArtifactTTL, true, &o.GCArtifactTTL},
+		{"MULTICA_GC_TTL", fileCfg.GCTTL, false, &o.GCTTL},
+		{"MULTICA_GC_INTERVAL", fileCfg.GCInterval, false, &o.GCInterval},
+		{"MULTICA_GC_CODEX_SESSION_TTL", fileCfg.GCCodexSessionTTL, true, &o.GCCodexSessionTTL},
+		{"MULTICA_GC_TERMINAL_ARTIFACT_TTL", fileCfg.GCTerminalArtifactTTL, true, &o.GCTerminalArtifactTTL},
+		{"MULTICA_GC_SALVAGE_TTL", fileCfg.GCSalvageTTL, true, &o.GCSalvageTTL},
+	} {
+		v, err := resolveGCDurationOverride(d.env, d.cfg, d.zero)
+		if err != nil {
+			return err
+		}
+		*d.dst = v
+	}
+	if envUnset("MULTICA_GC_SALVAGE") {
+		o.GCSalvage = fileCfg.GCSalvage
+	}
+	if envUnset("MULTICA_GC_SALVAGE_MAX_MB") {
+		o.GCSalvageMaxMB = fileCfg.GCSalvageMaxMB
+	}
+	if envUnset("MULTICA_GC_SALVAGE_TOTAL_MAX_MB") {
+		o.GCSalvageTotalMaxMB = fileCfg.GCSalvageTotalMaxMB
+	}
+	return nil
+}
+
+// resolveGCDurationOverride returns nil when the env var is set or the key is
+// not persisted. A persisted value that does not parse is an error, not a
+// fallback to the default: `config set` rejects it at write time, and a
+// hand-edited config.json must fail as loudly.
+func resolveGCDurationOverride(envName, cfgValue string, allowZero bool) (*time.Duration, error) {
+	if !envUnset(envName) || strings.TrimSpace(cfgValue) == "" {
+		return nil, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(cfgValue))
+	if err != nil {
+		return nil, fmt.Errorf("config value %q for %s is not a valid duration: %w", cfgValue, envName, err)
+	}
+	if d < 0 || (d == 0 && !allowZero) {
+		return nil, fmt.Errorf("config value %q for %s is out of range", cfgValue, envName)
+	}
+	return &d, nil
 }
 
 // --- daemon disk-usage ---

@@ -93,6 +93,11 @@ func (d *Daemon) runGC(ctx context.Context) {
 		return
 	}
 
+	// Before anything can write a new bundle: drop scratch left by a crashed
+	// salvage and expire old bundles, so the size check in salvageHasRoom
+	// measures what is actually still needed.
+	d.sweepSalvage()
+
 	stats := &gcStats{byPattern: map[string]int{}}
 	for _, wsEntry := range entries {
 		// Skip every daemon-internal dot directory, not just .repos. A
@@ -226,7 +231,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 			}
 		}
 		action := d.shouldCleanTaskDir(ctx, taskDir)
-		cleanedHere += d.applyGCAction(taskDir, action, stats)
+		cleanedHere += d.applyGCActionContext(ctx, taskDir, action, stats)
 	}
 	workspaceIDs := make([]string, 0, len(issueCandidatesByWorkspace))
 	for workspaceID := range issueCandidatesByWorkspace {
@@ -306,13 +311,13 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 			// data stays. The regenerable Codex cache is still fair game —
 			// see applyManagedArtifactFallback.
 			action := d.applyManagedArtifactFallback(candidate.taskDir, candidate.meta, gcActionSkip)
-			cleaned += d.applyGCAction(candidate.taskDir, action, stats)
+			cleaned += d.applyGCActionContext(ctx, candidate.taskDir, action, stats)
 			continue
 		}
 		action := d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
 		action = d.applyManagedArtifactFallback(candidate.taskDir, candidate.meta, action)
-		cleaned += d.applyGCAction(candidate.taskDir, action, stats)
+		cleaned += d.applyGCActionContext(ctx, candidate.taskDir, action, stats)
 	}
 	return cleaned
 }
@@ -321,6 +326,10 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 // atomically reserves the env root because a task can start while the server
 // reconciliation request is in flight.
 func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) int {
+	return d.applyGCActionContext(context.Background(), taskDir, action, stats)
+}
+
+func (d *Daemon) applyGCActionContext(ctx context.Context, taskDir string, action gcAction, stats *gcStats) int {
 	if action != gcActionSkip {
 		if _, err := d.gcTaskDirOwner(taskDir); err != nil {
 			d.logger.Warn("gc: refusing to mutate unowned task directory", "dir", taskDir, "error", err)
@@ -343,7 +352,7 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 	}
 	switch action {
 	case gcActionClean:
-		bytes, removed := d.cleanTaskDir(taskDir)
+		bytes, removed := d.cleanTaskDirContext(ctx, taskDir)
 		if !removed {
 			stats.skipped++
 			return 0
@@ -352,7 +361,7 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
-		bytes, removed := d.cleanTaskDir(taskDir)
+		bytes, removed := d.cleanTaskDirContext(ctx, taskDir)
 		if !removed {
 			stats.skipped++
 			return 0
@@ -363,6 +372,7 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 	case gcActionCleanArtifacts:
 		removed, bytes, perPattern := d.cleanTaskArtifacts(taskDir, d.cfg.GCArtifactPatterns)
 		recordArtifactCleanup(stats, removed, bytes, perPattern)
+		d.markArtifactsCleaned(taskDir)
 		stats.skipped++ // task dir itself preserved
 	case gcActionCleanManagedArtifacts:
 		removed, bytes, perPattern := d.cleanManagedTaskArtifacts(taskDir)
@@ -620,7 +630,18 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 		return gcActionClean
 	}
 
-	if d.cfg.GCArtifactTTL > 0 && !meta.CompletedAt.IsZero() && time.Since(meta.CompletedAt) > d.cfg.GCArtifactTTL {
+	artifactTTL := d.cfg.GCArtifactTTL
+	if terminal && d.cfg.GCTerminalArtifactTTL > 0 {
+		artifactTTL = d.cfg.GCTerminalArtifactTTL
+	}
+	// A terminal card past its artifact TTL keeps coming back every cycle until
+	// GCTTL removes the whole directory. The marker records that the walk
+	// already ran after the last completion, so a short interval does not
+	// repeat it. Every walk writes the marker, but open cards ignore it: their
+	// artifacts return whenever an agent runs, and a completion always moves
+	// completed_at past the marker.
+	if d.cfg.GCArtifactTTL > 0 && !meta.CompletedAt.IsZero() && time.Since(meta.CompletedAt) > artifactTTL &&
+		!(terminal && artifactsAlreadyCleaned(taskDir, meta.CompletedAt)) {
 		d.logger.Info("gc: eligible for artifact cleanup",
 			"dir", filepath.Base(taskDir),
 			"kind", "issue",
@@ -894,6 +915,13 @@ func (d *Daemon) gcTaskDirOwner(taskDir string) (*execenv.EnvRootOwner, error) {
 // reclaimed bytes, and returns that count for the cycle summary. A failed or
 // refused removal reports removed=false.
 func (d *Daemon) cleanTaskDir(taskDir string) (bytes int64, removed bool) {
+	return d.cleanTaskDirContext(context.Background(), taskDir)
+}
+
+// cleanTaskDirContext is where salvage sits. Every full removal, whether the
+// decision was gcActionClean or gcActionOrphan and whatever the task kind, goes
+// through here, so no removal path can skip the check for unsaved work.
+func (d *Daemon) cleanTaskDirContext(ctx context.Context, taskDir string) (bytes int64, removed bool) {
 	// Measure first, prove ownership second. dirSize walks the entire tree,
 	// which on a large task directory takes long enough for the validated
 	// directory to be replaced underneath us — checking before that walk would
@@ -903,6 +931,12 @@ func (d *Daemon) cleanTaskDir(taskDir string) (bytes int64, removed bool) {
 	owner, ownerErr := d.gcTaskDirOwner(taskDir)
 	if ownerErr != nil {
 		d.logger.Warn("gc: refusing to remove unowned task directory", "dir", taskDir, "error", ownerErr)
+		return 0, false
+	}
+	// After the ownership proof and before the removal, inside the reservation
+	// applyGCAction holds. Moving it later would delete first and look second;
+	// moving it before the proof would read a directory that is not ours.
+	if !d.salvageTaskDir(ctx, taskDir, *owner) {
 		return 0, false
 	}
 	if err := os.RemoveAll(taskDir); err != nil {
@@ -1191,8 +1225,10 @@ func (d *Daemon) pruneRepoWorktreesContext(ctx context.Context, workspacesRoot s
 
 func (d *Daemon) maintainRepoCache(ctx context.Context, barePath string, stats *gcStats) {
 	d.withRepoMaintenance(ctx, barePath, func(maintenanceCtx context.Context) {
-		d.pruneWorktreeLocked(maintenanceCtx, barePath)
-		if maintenanceCtx.Err() == nil {
+		// A repo whose prune kept an unsaved branch, or could not list its
+		// branches, still holds commits that exist nowhere else.
+		evictable := d.pruneWorktreeLocked(maintenanceCtx, barePath)
+		if evictable && maintenanceCtx.Err() == nil {
 			d.evictRepoCacheLocked(maintenanceCtx, barePath, stats)
 		}
 	})
@@ -1381,10 +1417,13 @@ func linkedWorktreeCountContext(ctx context.Context, barePath string) (int, erro
 	return count, nil
 }
 
-func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
+// pruneWorktreeLocked reports whether the repo may be evicted: false when an
+// agent branch was kept because its unpushed commits could not be salvaged,
+// or when the branches could not be listed at all.
+func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) (evictable bool) {
 	if out, err := runGitGCCommandContext(ctx, barePath, "worktree", "prune"); err != nil {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		d.logger.Warn("gc: worktree prune failed",
 			"repo", barePath,
@@ -1396,29 +1435,36 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 	activeBranches, err := agentWorktreeBranchesContext(ctx, barePath)
 	if err != nil {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		d.logger.Warn("gc: worktree branch scan failed", "repo", barePath, "error", err)
-		return
+		return false
 	}
 
 	agentBranches, err := listAgentBranchesContext(ctx, barePath)
 	if err != nil {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		d.logger.Warn("gc: agent branch scan failed", "repo", barePath, "error", err)
-		return
+		return false
 	}
 
-	deleted := 0
+	deleted, kept := 0, 0
 	for _, branch := range agentBranches {
 		if _, ok := activeBranches[branch]; ok {
 			continue
 		}
+		// Bundle the branch's unpushed commits before `branch -D` and keep the
+		// branch when that fails. The order matters: once the ref is deleted,
+		// reflog expiry and gc below make its commits unreachable for good.
+		if !d.salvageAgentBranch(ctx, barePath, branch) {
+			kept++
+			continue
+		}
 		if out, err := runGitGCCommandContext(ctx, barePath, "branch", "-D", "--", branch); err != nil {
 			if ctx.Err() != nil {
-				return
+				return false
 			}
 			d.logger.Warn("gc: agent branch delete failed",
 				"repo", barePath,
@@ -1441,11 +1487,11 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 		pending = true
 	}
 	if !pending {
-		return
+		return kept == 0
 	}
 	if !d.cfg.GCRepoMaintenanceEnabled {
 		d.logger.Debug("gc: heavy repo maintenance disabled", "repo", barePath)
-		return
+		return kept == 0
 	}
 	// Agent CLIs can mutate linked-worktree refs directly, outside the daemon's
 	// in-process repository gate. Do not start heavy maintenance while any task
@@ -1453,7 +1499,7 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 	// through the maintenance context below.
 	if d.activeTasks.Load() > 0 {
 		d.logger.Debug("gc: heavy repo maintenance deferred while tasks are active", "repo", barePath)
-		return
+		return kept == 0
 	}
 
 	// Heavier maintenance only runs when we actually removed refs, so we don't
@@ -1470,7 +1516,7 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 	completed := true
 	for _, step := range maintenance {
 		if ctx.Err() != nil || d.activeTasks.Load() > 0 {
-			return
+			return kept == 0
 		}
 		before := snapshotRepoMaintenanceLocks(barePath)
 		if out, err := runGitCommandContext(ctx, barePath, step.timeout, step.args...); err != nil {
@@ -1483,7 +1529,7 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 					"repo", barePath,
 					"command", strings.Join(step.args, " "),
 				)
-				return
+				return kept == 0
 			}
 			d.logger.Warn("gc: git maintenance failed",
 				"repo", barePath,
@@ -1498,6 +1544,7 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 			d.logger.Warn("gc: clear pending repo maintenance failed", "repo", barePath, "error", err)
 		}
 	}
+	return kept == 0
 }
 
 func runGitGCCommand(barePath string, args ...string) (string, error) {

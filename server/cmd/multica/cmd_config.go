@@ -36,6 +36,8 @@ var configSetSupportedKeys = []string{
 	"runtime_name",
 	"workspaces_root",
 	"max_concurrent_tasks",
+	"task_memory_mb",
+	"task_memory_reserve_mb",
 	"poll_interval",
 	"ws_claim_poll_interval",
 	"heartbeat_interval",
@@ -45,6 +47,15 @@ var configSetSupportedKeys = []string{
 	"disable_auto_update",
 	"auto_update_check_interval",
 	"disable_auto_reload",
+	"gc_artifact_ttl",
+	"gc_ttl",
+	"gc_interval",
+	"gc_codex_session_ttl",
+	"gc_terminal_artifact_ttl",
+	"gc_salvage",
+	"gc_salvage_max_mb",
+	"gc_salvage_total_max_mb",
+	"gc_salvage_ttl",
 }
 
 var configSetCmd = &cobra.Command{
@@ -55,7 +66,10 @@ var configSetCmd = &cobra.Command{
 		"device_name, runtime_name, workspaces_root, max_concurrent_tasks, poll_interval, ws_claim_poll_interval, " +
 		"heartbeat_interval, agent_timeout, " +
 		"codex_semantic_inactivity_timeout, codex_handshake_timeout, " +
-		"disable_auto_update, auto_update_check_interval, disable_auto_reload.\n\n" +
+		"disable_auto_update, auto_update_check_interval, disable_auto_reload, " +
+		"gc_artifact_ttl, gc_ttl, gc_interval, gc_codex_session_ttl, gc_terminal_artifact_ttl, " +
+		"gc_salvage, gc_salvage_max_mb, gc_salvage_total_max_mb, gc_salvage_ttl, " +
+		"task_memory_mb, task_memory_reserve_mb.\n\n" +
 		"The daemon keys (device_name, runtime_name, workspaces_root, max_concurrent_tasks, " +
 		"poll_interval, ws_claim_poll_interval, heartbeat_interval, agent_timeout, " +
 		"codex_semantic_inactivity_timeout, codex_handshake_timeout, " +
@@ -70,7 +84,19 @@ var configSetCmd = &cobra.Command{
 		"(single-direction: setting one to 'true' turns that behavior off, " +
 		"'false' clears the override so env/default decides). Pass an empty " +
 		"string to clear a persisted " +
-		"value (e.g. `config set poll_interval \"\"`).",
+		"value (e.g. `config set poll_interval \"\"`).\n\n" +
+		"The gc_* keys mirror their MULTICA_GC_* env vars and have no --flag, so " +
+		"precedence is: MULTICA_GC_… env > config.json > built-in default. " +
+		"gc_interval and gc_ttl take a positive Go duration; the other gc_* " +
+		"durations also accept '0s', which means the same as the env var set to 0. " +
+		"gc_salvage takes 'true' or 'false'; gc_salvage_max_mb and " +
+		"gc_salvage_total_max_mb take a non-negative integer.\n\n" +
+		"task_memory_mb and task_memory_reserve_mb size the default for " +
+		"max_concurrent_tasks when that is not set: (host memory - reserve) / " +
+		"task_memory_mb, capped at the CPU count and 20. They mirror " +
+		"MULTICA_DAEMON_TASK_MEMORY_MB and MULTICA_DAEMON_TASK_MEMORY_RESERVE_MB " +
+		"(env > config.json > default of 2048 each). task_memory_mb takes a " +
+		"positive integer; task_memory_reserve_mb takes an integer >= 0.",
 	Args: exactArgs(2),
 	RunE: runConfigSet,
 }
@@ -111,6 +137,17 @@ func runConfigShow(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintf(os.Stdout, "%-34s %t\n", "disable_auto_update:", cfg.DisableAutoUpdate)
 	fmt.Fprintf(os.Stdout, "%-34s %s\n", "auto_update_check_interval:", valueOrDefault(cfg.AutoUpdateCheckInterval, "(not set)"))
 	fmt.Fprintf(os.Stdout, "%-34s %t\n", "disable_auto_reload:", cfg.DisableAutoReload)
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "task_memory_mb:", optionalIntDisplay(cfg.TaskMemoryMB))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "task_memory_reserve_mb:", optionalIntDisplay(cfg.TaskMemoryReserveMB))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_artifact_ttl:", valueOrDefault(cfg.GCArtifactTTL, "(not set)"))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_ttl:", valueOrDefault(cfg.GCTTL, "(not set)"))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_interval:", valueOrDefault(cfg.GCInterval, "(not set)"))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_codex_session_ttl:", valueOrDefault(cfg.GCCodexSessionTTL, "(not set)"))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_terminal_artifact_ttl:", valueOrDefault(cfg.GCTerminalArtifactTTL, "(not set)"))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_salvage:", optionalBoolDisplay(cfg.GCSalvage))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_salvage_max_mb:", optionalIntDisplay(cfg.GCSalvageMaxMB))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_salvage_total_max_mb:", optionalIntDisplay(cfg.GCSalvageTotalMaxMB))
+	fmt.Fprintf(os.Stdout, "%-34s %s\n", "gc_salvage_ttl:", valueOrDefault(cfg.GCSalvageTTL, "(not set)"))
 	return nil
 }
 
@@ -254,6 +291,28 @@ func applyConfigSet(cfg *cli.CLIConfig, key, value string) error {
 		if err := assignBool(&cfg.DisableAutoReload, key, value); err != nil {
 			return err
 		}
+	case "task_memory_mb":
+		return assignOptionalPositiveInt(&cfg.TaskMemoryMB, key, value)
+	case "task_memory_reserve_mb":
+		return assignOptionalNonNegativeInt(&cfg.TaskMemoryReserveMB, key, value)
+	case "gc_interval":
+		return assignPositiveDuration(&cfg.GCInterval, key, value)
+	case "gc_ttl":
+		return assignPositiveDuration(&cfg.GCTTL, key, value)
+	case "gc_artifact_ttl":
+		return assignNonNegativeDuration(&cfg.GCArtifactTTL, key, value)
+	case "gc_codex_session_ttl":
+		return assignNonNegativeDuration(&cfg.GCCodexSessionTTL, key, value)
+	case "gc_terminal_artifact_ttl":
+		return assignNonNegativeDuration(&cfg.GCTerminalArtifactTTL, key, value)
+	case "gc_salvage_ttl":
+		return assignNonNegativeDuration(&cfg.GCSalvageTTL, key, value)
+	case "gc_salvage":
+		return assignOptionalBool(&cfg.GCSalvage, key, value)
+	case "gc_salvage_max_mb":
+		return assignOptionalNonNegativeInt(&cfg.GCSalvageMaxMB, key, value)
+	case "gc_salvage_total_max_mb":
+		return assignOptionalNonNegativeInt(&cfg.GCSalvageTotalMaxMB, key, value)
 	default:
 		return fmt.Errorf("unknown config key %q (supported: %s)", key, joinKeys(configSetSupportedKeys))
 	}
@@ -294,6 +353,91 @@ func assignPositiveDuration(dst *string, key, value string) error {
 	}
 	*dst = normalized
 	return nil
+}
+
+// assignNonNegativeDuration is assignPositiveDuration for the gc_* keys
+// where 0 means what the env var set to 0 means (disable, or "same as
+// gc_artifact_ttl"). Empty string clears the field.
+func assignNonNegativeDuration(dst *string, key, value string) error {
+	if value == "" {
+		*dst = ""
+		return nil
+	}
+	normalized := strings.TrimSpace(value)
+	d, err := time.ParseDuration(normalized)
+	if err != nil {
+		return fmt.Errorf("%s must be a Go duration (e.g. 12h, 30m, 0s): %w", key, err)
+	}
+	if d < 0 {
+		return fmt.Errorf("%s must be >= 0 (got %s); use `config set %s \"\"` to clear it", key, d, key)
+	}
+	*dst = normalized
+	return nil
+}
+
+// assignOptionalBool stores a strict bool behind a pointer so that a
+// persisted false stays distinguishable from "not set". Empty string clears.
+func assignOptionalBool(dst **bool, key, value string) error {
+	if value == "" {
+		*dst = nil
+		return nil
+	}
+	b, err := strconv.ParseBool(value)
+	if err != nil {
+		return fmt.Errorf("%s must be 'true' or 'false' (got %q)", key, value)
+	}
+	*dst = &b
+	return nil
+}
+
+// assignOptionalNonNegativeInt stores an int behind a pointer so that a
+// persisted 0 stays distinguishable from "not set". Empty string clears.
+func assignOptionalNonNegativeInt(dst **int, key, value string) error {
+	if value == "" {
+		*dst = nil
+		return nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+	if n < 0 {
+		return fmt.Errorf("%s must be >= 0 (got %d)", key, n)
+	}
+	*dst = &n
+	return nil
+}
+
+// assignOptionalPositiveInt is assignOptionalNonNegativeInt for a setting
+// where 0 would divide by zero or mean nothing. Empty string clears.
+func assignOptionalPositiveInt(dst **int, key, value string) error {
+	if value == "" {
+		*dst = nil
+		return nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+	if n <= 0 {
+		return fmt.Errorf("%s must be > 0 (got %d)", key, n)
+	}
+	*dst = &n
+	return nil
+}
+
+func optionalBoolDisplay(v *bool) string {
+	if v == nil {
+		return "(not set)"
+	}
+	return strconv.FormatBool(*v)
+}
+
+func optionalIntDisplay(v *int) string {
+	if v == nil {
+		return "(not set)"
+	}
+	return strconv.Itoa(*v)
 }
 
 // agentTimeoutDisplay renders the tri-state agent_timeout value for
