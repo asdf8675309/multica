@@ -1,0 +1,10 @@
+[Unit]
+Description=Scan standalone Multica worktrees for %i every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=multica-standalone-gc@%i.service
+
+[Install]
+WantedBy=timers.target

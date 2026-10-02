@@ -1,0 +1,15 @@
+[Unit]
+Description=Collect completed standalone Multica worktrees for %i
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/multica-standalone-gc.py --config /etc/multica/standalone-gc-%i.json --apply
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
